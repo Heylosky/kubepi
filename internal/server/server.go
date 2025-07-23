@@ -1,8 +1,10 @@
 package server
 
 import (
+	"crypto/tls"
 	"embed"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -287,6 +289,66 @@ func (e *KubePiServer) setUpTtyEntrypoint() {
 	}
 }
 
+func (e *KubePiServer) setUpApisProxy() {
+	apis := e.app.Party("/apis")
+	{
+		// 处理所有/apis/*path的请求，对应Gin的*path参数
+		apis.Any("/{path:path}", func(ctx *context.Context) {
+			// 解析远程代理地址 (对应Gin中的opts.ApisProxyEndpoint)
+			// remote, err := url.Parse(opts.ApisProxyEndpoint)
+			remote, err := url.Parse("https://karmada-apiserver.karmada-system.svc.cluster.local:5443")
+			if err != nil {
+				ctx.StopWithJSON(http.StatusInternalServerError, iris.Map{
+					"error": "解析代理地址失败: " + err.Error(),
+				})
+				return
+			}
+
+			// 加载客户端证书 (对应Gin中的证书加载逻辑)
+			// cert, err := tls.LoadX509KeyPair(opts.ApisProxyCertFile, opts.ApisProxyKeyFile)
+			cert, err := tls.LoadX509KeyPair("./cert/client.crt", "./cert/client.key")
+			if err != nil {
+				ctx.StopWithJSON(http.StatusInternalServerError, iris.Map{
+					"error": "加载客户端证书失败: " + err.Error(),
+				})
+				return
+			}
+
+			// 配置TLS (与Gin中的tlsConfig保持一致)
+			tlsConfig := &tls.Config{
+				Certificates:       []tls.Certificate{cert},
+				InsecureSkipVerify: true, // 注意：生产环境中不建议使用
+			}
+
+			// 创建反向代理 (对应Gin中的httputil.NewSingleHostReverseProxy)
+			proxy := httputil.NewSingleHostReverseProxy(remote)
+			proxy.Transport = &http.Transport{
+				TLSClientConfig: tlsConfig,
+				DialContext: (&net.Dialer{
+					Timeout:   30 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				TLSHandshakeTimeout: 10 * time.Second,
+			}
+
+			// 配置代理Director (与Gin中的逻辑一致)
+			proxy.Director = func(req *http.Request) {
+				// 复制请求头
+				req.Header = ctx.Request().Header.Clone()
+				// 设置Host和URL信息
+				req.Host = remote.Host
+				req.URL.Scheme = remote.Scheme
+				req.URL.Host = remote.Host
+				// 移除路径前缀 (对应Gin中的strings.TrimPrefix)
+				req.URL.Path = strings.TrimPrefix(req.URL.Path, "/apis")
+			}
+
+			// 执行代理请求 (对应Gin中的proxy.ServeHTTP)
+			proxy.ServeHTTP(ctx.ResponseWriter(), ctx.Request())
+		})
+	}
+}
+
 func (e *KubePiServer) bootstrap() *KubePiServer {
 	e.setUpRootRoute()
 	e.setUpStaticFile()
@@ -299,6 +361,7 @@ func (e *KubePiServer) bootstrap() *KubePiServer {
 	e.runMigrations()
 	e.setUpTtyEntrypoint()
 	e.startTty()
+	e.setUpApisProxy()
 	return e
 }
 
