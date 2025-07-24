@@ -289,10 +289,17 @@ func (e *KubePiServer) setUpTtyEntrypoint() {
 	}
 }
 
+func (e *KubePiServer) setUpTestRoute() {
+	e.app.Any("/apitest/*a", func(ctx *context.Context) {
+		ctx.Redirect("/kubepi")
+	})
+}
+
 func (e *KubePiServer) setUpApisProxy() {
-	//	https://karmada-apiserver.karmada-system.svc.cluster.local:5443
-	e.app.Any("/apis/*path", func(ctx *context.Context) {
-		remote, err := url.Parse("https://karmada-apiserver.karmada-system.svc.cluster.local:5443")
+	e.app.Any("/apis/*", func(ctx *context.Context) {
+		// 目标服务地址
+		targetAddr := "https://karmada-apiserver.karmada-system.svc.cluster.local:5443"
+		remote, err := url.Parse(targetAddr)
 		if err != nil {
 			ctx.StopWithJSON(http.StatusInternalServerError, iris.Map{
 				"error": "解析代理地址失败: " + err.Error(),
@@ -300,6 +307,7 @@ func (e *KubePiServer) setUpApisProxy() {
 			return
 		}
 
+		// 加载客户端证书
 		cert, err := tls.LoadX509KeyPair("/cert/client.crt", "/cert/client.key")
 		if err != nil {
 			ctx.StopWithJSON(http.StatusInternalServerError, iris.Map{
@@ -307,13 +315,15 @@ func (e *KubePiServer) setUpApisProxy() {
 			})
 			return
 		}
+
+		// 配置TLS
 		tlsConfig := &tls.Config{
 			Certificates:       []tls.Certificate{cert},
-			InsecureSkipVerify: true,
+			InsecureSkipVerify: true, // 根据实际情况决定是否启用
 		}
 
-		proxy := httputil.NewSingleHostReverseProxy(remote)
-		proxy.Transport = &http.Transport{
+		// 创建传输层配置
+		transport := &http.Transport{
 			TLSClientConfig: tlsConfig,
 			DialContext: (&net.Dialer{
 				Timeout:   30 * time.Second,
@@ -321,14 +331,42 @@ func (e *KubePiServer) setUpApisProxy() {
 			}).DialContext,
 			TLSHandshakeTimeout: 10 * time.Second,
 		}
+
+		// 创建反向代理
+		proxy := httputil.NewSingleHostReverseProxy(remote)
+		proxy.Transport = transport
+
+		// 配置代理行为 - 不修改原始路径
 		proxy.Director = func(req *http.Request) {
-			e.logger.Info(req.URL.Path)
-			req.Header = ctx.Request().Header.Clone()
-			req.Host = remote.Host
+			// 复制原始请求的URL信息
 			req.URL.Scheme = remote.Scheme
 			req.URL.Host = remote.Host
-			req.URL.Path = strings.TrimPrefix(req.URL.Path, "")
+			// 不修改路径，保持原始请求路径
+			// req.URL.Path 保持不变，使用原始请求的Path
+
+			// 复制请求头
+			req.Header = ctx.Request().Header.Clone()
+
+			// 设置Host头为目标服务Host
+			req.Host = remote.Host
+
+			// 调试日志
+			ctx.Application().Logger().Infof("转发请求: %s %s -> %s%s",
+				req.Method,
+				ctx.Request().URL.String(),
+				remote.Host,
+				req.URL.Path)
 		}
+
+		// 错误处理
+		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+			ctx.Application().Logger().Errorf("代理错误: %v", err)
+			ctx.StopWithJSON(http.StatusBadGateway, iris.Map{
+				"error": "代理请求失败: " + err.Error(),
+			})
+		}
+
+		// 执行代理
 		proxy.ServeHTTP(ctx.ResponseWriter(), ctx.Request())
 	})
 }
@@ -346,6 +384,7 @@ func (e *KubePiServer) bootstrap() *KubePiServer {
 	e.setUpTtyEntrypoint()
 	e.startTty()
 	e.setUpApisProxy()
+	e.setUpTestRoute()
 	return e
 }
 
